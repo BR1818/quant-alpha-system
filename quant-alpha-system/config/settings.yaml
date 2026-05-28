@@ -1,0 +1,31 @@
+# Quant Alpha System 全局配置
+data_dir: "/Users/zhengborui/Documents/Claude-workspace/quant-DB/quantdb/data/curated"
+cache_dir: "output/cache"
+log_dir: "output/logs"
+model_dir: "output/models"
+report_dir: "output/reports"
+
+factor_weights:
+  technical: 0.3
+  fundamental: 0.25
+  moneyflow: 0.25
+  sentiment: 0.2
+
+lstm_params:
+  hidden_dim: 64
+  num_layers: 2
+  epochs: 100
+  batch_size: 32
+
+xgboost_params:
+  max_depth: 6
+  learning_rate: 0.1
+  n_estimators: 100
+  subsample: 0.8
+  colsample_bytree: 0.8
+  random_state: 42
+
+backtest:
+  initial_capital: 1000000
+  transaction_cost: 0.001
+  rebalance_freq: "W"
