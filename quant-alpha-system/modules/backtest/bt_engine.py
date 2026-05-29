@@ -3,11 +3,29 @@
 import backtrader as bt
 import pandas as pd
 import numpy as np
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Optional
 import math
 import logging
 
 from modules.backtest.ac_stock_commission import ACStockCommission
+
+
+class PortfolioValueRecorder(bt.Analyzer):
+    """记录每个bar的组合价值，用于净值曲线和回撤计算"""
+    params = (
+        ('fund', None),
+    )
+
+    def start(self):
+        self._values = []
+
+    def next(self):
+        dt = self.data.datetime.date(0)
+        val = self.strategy.broker.getvalue()
+        self._values.append((dt, val))
+
+    def get_analysis(self):
+        return self._values
 
 
 class AlphaPandasData(bt.feeds.PandasData):
@@ -38,6 +56,8 @@ class QuantAlphaStrategy(bt.Strategy):
         self.hold_days = 0
         self.stop_price = 0.0
         self.highest_since_buy = 0.0
+        self.entry_date = None
+        self.entry_price = None
 
         # ATR 指标
         self.atr = bt.indicators.ATR(self.datas[0], period=self.p.atr_period)
@@ -51,6 +71,8 @@ class QuantAlphaStrategy(bt.Strategy):
             if order.isbuy():
                 self.buy_price = order.executed.price
                 self.buy_bar = len(self)
+                self.entry_date = self.data.datetime.date(0)
+                self.entry_price = order.executed.price
                 self.hold_days = 0
                 self.highest_since_buy = order.executed.price
                 atr_val = self.atr[0] if self.atr[0] > 0 else order.executed.price * 0.03
@@ -61,6 +83,12 @@ class QuantAlphaStrategy(bt.Strategy):
     def notify_trade(self, trade):
         if trade.isclosed:
             self.trade_log.append({
+                "entry_date": self.entry_date,
+                "exit_date": self.data.datetime.date(0),
+                "entry_price": self.entry_price,
+                "exit_price": trade.pnl / trade.size + trade.price if trade.size else 0,
+                "size": trade.size,
+                "commission": trade.commission,
                 "pnl": trade.pnl,
                 "pnlcomm": trade.pnlcomm,
                 "barlen": trade.barlen,
@@ -127,6 +155,34 @@ class QuantAlphaStrategy(bt.Strategy):
                 self.order = self.close()
 
 
+def compute_alpha_beta(strat_ret: pd.Series, bench_ret: pd.Series):
+    """用 numpy 计算 Alpha 和 Beta (年化)"""
+    X = bench_ret.values
+    Y = strat_ret.values
+    X_mean = X.mean()
+    Y_mean = Y.mean()
+    ss_xy = np.sum((X - X_mean) * (Y - Y_mean))
+    ss_xx = np.sum((X - X_mean) ** 2)
+    beta = ss_xy / ss_xx if ss_xx > 0 else 0.0
+    alpha = (Y_mean - beta * X_mean) * 252 * 100
+    return beta, alpha
+
+
+def compute_sortino(daily_returns: pd.Series, rf: float = 0.02) -> float:
+    """计算年化 Sortino 比率"""
+    annual_return = (1 + daily_returns).prod() ** (252 / len(daily_returns)) - 1
+    downside = daily_returns[daily_returns < rf / 252]
+    downside_std = downside.std() * np.sqrt(252) if len(downside) > 0 else 0.0
+    return (annual_return - rf) / downside_std if downside_std > 0 else 0.0
+
+
+def compute_information_ratio(strat_ret: pd.Series, bench_ret: pd.Series) -> float:
+    """计算年化 Information Ratio"""
+    excess = strat_ret.values - bench_ret.values
+    std = excess.std()
+    return excess.mean() / std * np.sqrt(252) if std > 0 else 0.0
+
+
 class BTEngine:
     """封装 Backtrader 框架，处理数据挂载与分析器"""
     def __init__(self, config: Dict[str, Any]):
@@ -142,8 +198,9 @@ class BTEngine:
 
         self.cerebro.broker.set_slippage_perc(perc=0.001)
 
-    def run_backtest(self, df: pd.DataFrame, strategy_params: Dict[str, Any] = None) -> Tuple[Dict[str, Any], bt.Cerebro]:
-        """执行回测并提取严谨的数据指标"""
+    def run_backtest(self, df: pd.DataFrame, strategy_params: Dict[str, Any] = None,
+                     benchmark_df: pd.DataFrame = None) -> Dict[str, Any]:
+        """执行回测并返回完整结果字典"""
         df = df.copy()
 
         if not pd.api.types.is_datetime64_any_dtype(df.index):
@@ -165,8 +222,12 @@ class BTEngine:
         p = strategy_params or {}
         self.cerebro.addstrategy(QuantAlphaStrategy, **p)
 
+        # 分析器
+        self.cerebro.addanalyzer(PortfolioValueRecorder, _name="portfolio_value")
+        self.cerebro.addanalyzer(bt.analyzers.TimeReturn, _name="daily_returns",
+                                 timeframe=bt.TimeFrame.Days)
         self.cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name="trades")
-        self.cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name="sharpe", riskfreerate=0.02)
+        self.cerebro.addanalyzer(bt.analyzers.SharpeRatio_A, _name="sharpe_annual", riskfreerate=0.02)
         self.cerebro.addanalyzer(bt.analyzers.DrawDown, _name="drawdown")
         self.cerebro.addanalyzer(bt.analyzers.Returns, _name="returns")
 
@@ -175,6 +236,19 @@ class BTEngine:
         results = self.cerebro.run()
         strat = results[0]
 
+        # 提取组合价值时间序列
+        pv_data = strat.analyzers.portfolio_value.get_analysis()
+        portfolio_df = pd.DataFrame(pv_data, columns=["date", "value"])
+
+        # 提取日收益率时间序列
+        daily_returns_dict = strat.analyzers.daily_returns.get_analysis()
+        daily_returns = pd.Series(daily_returns_dict, name="daily_return")
+        daily_returns.index = pd.to_datetime(daily_returns.index)
+
+        # 提取交易日志
+        trade_log = strat.trade_log
+
+        # 基础指标
         final_value = self.cerebro.broker.getvalue()
         total_return_pct = ((final_value / self.initial_cash) - 1) * 100
 
@@ -185,7 +259,7 @@ class BTEngine:
             annual_return_pct = 0
 
         trade_analyzer = strat.analyzers.trades.get_analysis()
-        sharpe_analyzer = strat.analyzers.sharpe.get_analysis()
+        sharpe_analyzer = strat.analyzers.sharpe_annual.get_analysis()
         drawdown_analyzer = strat.analyzers.drawdown.get_analysis()
 
         total_trades = trade_analyzer.get('total', {}).get('closed', 0)
@@ -197,17 +271,77 @@ class BTEngine:
         avg_lost = abs(trade_analyzer.get('lost', {}).get('pnl', {}).get('average', 1) or 1)
         profit_loss_ratio = avg_won / avg_lost if avg_lost > 0 else 0
 
+        # 从日收益率计算扩展指标
+        volatility_pct = daily_returns.std() * np.sqrt(252) * 100 if len(daily_returns) > 1 else 0.0
+        downside = daily_returns[daily_returns < 0]
+        downside_risk_pct = downside.std() * np.sqrt(252) * 100 if len(downside) > 1 else 0.0
+        sortino_ratio = compute_sortino(daily_returns) if len(daily_returns) > 1 else 0.0
+        max_dd_pct = drawdown_analyzer.get('max', {}).get('drawdown', 0.0)
+        calmar_ratio = annual_return_pct / max_dd_pct if max_dd_pct > 0 else 0.0
+        avg_hold_days = np.mean([t["barlen"] for t in trade_log]) if trade_log else 0.0
+
         metrics = {
             "total_return_pct": total_return_pct,
             "annual_return_pct": annual_return_pct,
             "sharpe_ratio": sharpe_analyzer.get('sharperatio', 0.0) or 0.0,
-            "max_drawdown_pct": drawdown_analyzer.get('max', {}).get('drawdown', 0.0),
+            "max_drawdown_pct": max_dd_pct,
             "win_rate_pct": win_rate,
             "trade_count": total_trades,
             "won_trades": won_trades,
             "lost_trades": lost_trades,
             "profit_loss_ratio": profit_loss_ratio,
             "final_value": final_value,
+            "volatility_pct": volatility_pct,
+            "downside_risk_pct": downside_risk_pct,
+            "sortino_ratio": sortino_ratio,
+            "calmar_ratio": calmar_ratio,
+            "avg_hold_days": avg_hold_days,
+            # 基准相关，稍后填充
+            "benchmark_annual_return_pct": None,
+            "excess_return_pct": None,
+            "alpha": None,
+            "beta": None,
+            "information_ratio": None,
         }
 
-        return metrics, self.cerebro
+        # 基准处理：回测后用 pandas 对齐日收益率
+        benchmark_daily_returns = None
+        if benchmark_df is not None and len(benchmark_df) > 0:
+            bench = benchmark_df.copy()
+            if "trade_date" in bench.columns:
+                bench["date"] = pd.to_datetime(bench["trade_date"])
+                bench = bench.set_index("date").sort_index()
+            bench_daily = bench["close"].pct_change().dropna()
+            bench_daily.name = "benchmark_return"
+
+            # 对齐日期
+            aligned = pd.DataFrame({"strategy": daily_returns, "benchmark": bench_daily}).dropna()
+            if len(aligned) > 30:
+                benchmark_daily_returns = aligned["benchmark"]
+                strat_aligned = aligned["strategy"]
+                bench_aligned = aligned["benchmark"]
+
+                beta, alpha = compute_alpha_beta(strat_aligned, bench_aligned)
+                metrics["alpha"] = alpha
+                metrics["beta"] = beta
+                metrics["information_ratio"] = compute_information_ratio(strat_aligned, bench_aligned)
+
+                bench_cum = (1 + bench_aligned).prod()
+                bench_annual = (bench_cum ** (252 / len(bench_aligned)) - 1) * 100
+                metrics["benchmark_annual_return_pct"] = bench_annual
+                metrics["excess_return_pct"] = annual_return_pct - bench_annual
+
+        start_date = str(df.index[0].date()) if len(df) > 0 else ""
+        end_date = str(df.index[-1].date()) if len(df) > 0 else ""
+
+        return {
+            "metrics": metrics,
+            "portfolio_values": portfolio_df,
+            "daily_returns": daily_returns,
+            "benchmark_daily_returns": benchmark_daily_returns,
+            "trade_log": trade_log,
+            "strategy_name": "QuantAlphaStrategy",
+            "initial_cash": self.initial_cash,
+            "start_date": start_date,
+            "end_date": end_date,
+        }
