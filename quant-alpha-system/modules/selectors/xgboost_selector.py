@@ -32,8 +32,9 @@ class XGBoostSelector:
         self._feature_names: List[str] = []
         self._feature_importance: Dict[str, float] = {}
 
-    def train(self, X: pd.DataFrame, y: pd.Series, params: Optional[Dict[str, Any]] = None) -> None:
-        """训练选股模型"""
+    def train(self, X: pd.DataFrame, y: pd.Series, params: Optional[Dict[str, Any]] = None,
+              test_size: float = 0.2) -> None:
+        """训练选股模型 — 按时间顺序切分train/test，避免未来函数"""
         self.logger.info(f"训练 XGBoost 选股器: {X.shape[1]} 特征, {X.shape[0]} 样本")
         self._feature_names = list(X.columns)
 
@@ -41,13 +42,29 @@ class XGBoostSelector:
             self.params.update(params)
 
         X_clean = X.fillna(0).replace([np.inf, -np.inf], 0)
+
+        # 时序切分：前80%训练，后20%测试（严格按时间顺序，不shuffle）
+        split_idx = int(len(X_clean) * (1 - test_size))
+        X_train, X_test = X_clean.iloc[:split_idx], X_clean.iloc[split_idx:]
+        y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+
         self.model = xgb.XGBClassifier(**self.params)
-        self.model.fit(X_clean, y)
+        self.model.fit(X_train, y_train,
+                       eval_set=[(X_test, y_test)],
+                       verbose=False)
+
+        # 记录测试集AUC
+        from sklearn.metrics import roc_auc_score
+        try:
+            y_pred_proba = self.model.predict_proba(X_test)[:, 1]
+            auc = roc_auc_score(y_test, y_pred_proba)
+            self.logger.info(f"训练完成. Test AUC: {auc:.4f}")
+        except Exception:
+            self.logger.info("训练完成. 无法计算AUC(类别不足)")
 
         self._feature_importance = dict(
             zip(self._feature_names, self.model.feature_importances_)
         )
-        self.logger.info(f"训练完成. Top3 特征: {sorted(self._feature_importance.items(), key=lambda x: x[1], reverse=True)[:3]}")
 
     def select(self, data: pd.DataFrame, top_n: int = 50) -> pd.DataFrame:
         """选股"""

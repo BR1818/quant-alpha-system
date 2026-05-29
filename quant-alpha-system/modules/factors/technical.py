@@ -72,10 +72,13 @@ class RSIFactor:
             delta = data["close"].diff()
             gain = delta.where(delta > 0, 0.0)
             loss = (-delta).where(delta < 0, 0.0)
-            avg_gain = gain.rolling(window=period).mean()
-            avg_loss = loss.rolling(window=period).mean()
+            # Wilder EMA: alpha = 1/period
+            avg_gain = gain.ewm(alpha=1.0/period, adjust=False).mean()
+            avg_loss = loss.ewm(alpha=1.0/period, adjust=False).mean()
+            # 连续上涨时avg_loss=0，RSI应为100
             rs = avg_gain / avg_loss.replace(0, np.nan)
-            return 100.0 - (100.0 / (1.0 + rs))
+            rsi = 100.0 - (100.0 / (1.0 + rs))
+            return rsi.fillna(100.0)
 
     def get_required_columns(self) -> List[str]:
         return ["close"]
@@ -124,7 +127,8 @@ class ATRFactor:
             tr2 = abs(high - prev_close)
             tr3 = abs(low - prev_close)
             tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-            return tr.rolling(window=period).mean()
+            # Wilder EMA: alpha = 1/period
+            return tr.ewm(alpha=1.0/period, adjust=False).mean()
 
     def get_required_columns(self) -> List[str]:
         return ["high", "low", "close"]

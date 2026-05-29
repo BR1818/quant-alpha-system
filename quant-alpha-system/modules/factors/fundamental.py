@@ -12,7 +12,10 @@ class PE_TTM_Factor:
 
     def compute(self, data: pd.DataFrame, params: Optional[Dict[str, Any]] = None) -> pd.Series:
         pe = data["pe_ttm"].replace(0, np.nan).replace([np.inf, -np.inf], np.nan)
-        return 1.0 / pe
+        ep = 1.0 / pe
+        # 亏损公司PE为负，取倒数后语义反转，设为NaN
+        ep[pe < 0] = np.nan
+        return ep
 
     def get_required_columns(self) -> List[str]:
         return ["pe_ttm"]
@@ -28,7 +31,10 @@ class PB_Factor:
 
     def compute(self, data: pd.DataFrame, params: Optional[Dict[str, Any]] = None) -> pd.Series:
         pb = data["pb"].replace(0, np.nan).replace([np.inf, -np.inf], np.nan)
-        return 1.0 / pb
+        bp = 1.0 / pb
+        # 资不抵债公司PB为负，取倒数后语义反转，设为NaN
+        bp[pb < 0] = np.nan
+        return bp
 
     def get_required_columns(self) -> List[str]:
         return ["pb"]

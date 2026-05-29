@@ -40,6 +40,7 @@ def main():
 
     try:
         loader = QuantDBLoader(Path(config["data_dir"]))
+        registry = init_factor_registry()
         factor_engine = FactorEngine(registry)
         model_path = str(Path(config.get("model_dir", "output/models")) / "xgboost_selector.pkl")
         selector = EnsembleSelector(registry=registry, xgb_model_path=model_path)

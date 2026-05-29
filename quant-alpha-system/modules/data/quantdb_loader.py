@@ -57,6 +57,22 @@ class QuantDBLoader:
         self.logger.info(f"加载个股增强日线: {ts_code}, {start_date} ~ {end_date}")
         df = self.load_stock_daily(ts_code, start_date, end_date)
 
+        # 前复权处理：使用adj_factor对OHLCV做复权
+        try:
+            adj = self._load_parquet("adj_factor", ts_code)
+            if adj is not None:
+                adj["trade_date"] = pd.to_datetime(adj["trade_date"])
+                df = df.merge(adj[["trade_date", "adj_factor"]], on="trade_date", how="left")
+                if "adj_factor" in df.columns and df["adj_factor"].notna().any():
+                    latest_adj = df["adj_factor"].iloc[-1]
+                    for col in ["open", "high", "low", "close"]:
+                        df[col] = df[col] * df["adj_factor"] / latest_adj
+                    # volume/amount不复权
+                    df.drop(columns=["adj_factor"], inplace=True)
+                    self.logger.info("已应用前复权处理")
+        except Exception as e:
+            self.logger.warning(f"复权因子合并失败，使用不复权数据: {e}")
+
         # 合并 daily_basic（PE、PB、换手率、量比）
         try:
             basic = self._load_parquet("daily_basic", ts_code)
@@ -85,19 +101,37 @@ class QuantDBLoader:
         try:
             fina = self._load_parquet("fina_indicator", ts_code)
             if fina is not None:
-                # 修复未来函数：必须使用真实披露日(ann_date)而不是财报截止日(end_date)进行对齐
-                fina["trade_date"] = pd.to_datetime(fina["ann_date"])
-                fina_cols = ["trade_date", "roe", "q_sales_yoy", "eps", "net_profit_yoy"]
+                # Point-in-Time: 使用ann_date(披露日)而非end_date(截止日)
+                fina["ann_date"] = pd.to_datetime(fina["ann_date"])
+                fina = fina.dropna(subset=["ann_date"]).sort_values("ann_date")
+                # 同一天可能有多条(不同报告期)，取最新报告期
+                fina = fina.drop_duplicates(subset=["ann_date"], keep="last")
+
+                # 将ann_date映射到下一个交易日(交易日历对齐)
+                trade_dates = df["trade_date"].sort_values().values
+                fina["effective_date"] = fina["ann_date"].apply(
+                    lambda d: trade_dates[trade_dates >= d][0]
+                    if len(trade_dates[trade_dates >= d]) > 0 else pd.NaT
+                )
+                fina = fina.dropna(subset=["effective_date"])
+
+                fina_cols = ["effective_date", "roe", "q_sales_yoy", "eps", "net_profit_yoy"]
                 available = [c for c in fina_cols if c in fina.columns]
-                fina_sub = fina[available].sort_values("trade_date").drop_duplicates(subset=["trade_date"], keep="last")
-                df = df.merge(fina_sub, on="trade_date", how="left")
+                fina_sub = fina[available].sort_values("effective_date")
+
+                # merge_asof: 每个交易日取该日或之前最近的有效财报
+                df = pd.merge_asof(df, fina_sub, left_on="trade_date",
+                                   right_on="effective_date", direction="backward")
                 # 前向填充季度数据到每日
-                for c in [col for col in available if col != "trade_date"]:
+                for c in [col for col in available if col not in ("effective_date",)]:
                     df[c] = df[c].ffill()
                 # 营收增长率映射到 revenue_yoy
                 if "q_sales_yoy" in df.columns and "revenue_yoy" not in df.columns:
                     df["revenue_yoy"] = df["q_sales_yoy"]
-                self.logger.info(f"已合并 fina_indicator (Point-in-Time): {[c for c in available if c != 'trade_date']}")
+                # 清理辅助列
+                if "effective_date" in df.columns:
+                    df.drop(columns=["effective_date"], inplace=True)
+                self.logger.info(f"已合并 fina_indicator (Point-in-Time via merge_asof): {[c for c in available if c not in ('effective_date',)]}")
         except Exception as e:
             self.logger.warning(f"合并 fina_indicator 失败: {e}")
 
@@ -114,6 +148,44 @@ class QuantDBLoader:
                 self.logger.info(f"已合并 limit_list_d: {[c for c in available if c != 'trade_date']}")
         except Exception as e:
             self.logger.warning(f"合并 limit_list_d 失败: {e}")
+
+        # 停牌日标记：vol=0表示停牌
+        df["is_tradable"] = df.get("vol", df.get("volume", pd.Series(0, index=df.index))) > 0
+
+        # 加载停牌数据(suspend_d表)
+        try:
+            suspend = self._load_parquet("suspend_d", ts_code)
+            if suspend is not None:
+                suspend["trade_date"] = pd.to_datetime(suspend["trade_date"])
+                suspend_dates = set(suspend["trade_date"].tolist())
+                df.loc[df["trade_date"].isin(suspend_dates), "is_tradable"] = False
+                self.logger.info(f"已合并停牌数据: {len(suspend_dates)} 个停牌日")
+        except Exception as e:
+            self.logger.warning(f"停牌数据合并失败: {e}")
+
+        # 加载ST标记(st表)
+        try:
+            st_data = self._load_parquet("st", ts_code)
+            if st_data is not None and not st_data.empty:
+                df["is_st"] = False
+                if "imp_date" in st_data.columns:
+                    imp_date = pd.to_datetime(st_data["imp_date"].max())
+                    df.loc[df["trade_date"] >= imp_date, "is_st"] = True
+                self.logger.info("已合并ST标记数据")
+        except Exception as e:
+            self.logger.warning(f"ST数据合并失败: {e}")
+
+        # 加载涨跌停价格(stk_limit表)
+        try:
+            limit = self._load_parquet("stk_limit", ts_code)
+            if limit is not None:
+                limit["trade_date"] = pd.to_datetime(limit["trade_date"])
+                limit_cols = ["trade_date", "up_limit", "down_limit"]
+                available_limit = [c for c in limit_cols if c in limit.columns]
+                df = df.merge(limit[available_limit], on="trade_date", how="left")
+                self.logger.info("已合并涨跌停价格数据")
+        except Exception as e:
+            self.logger.warning(f"涨跌停数据合并失败: {e}")
 
         self.validator.validate(df, "stock_daily")
         self.cache.set(cache_key, df)

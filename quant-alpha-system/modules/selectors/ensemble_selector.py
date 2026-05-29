@@ -38,8 +38,16 @@ class EnsembleSelector:
         # 这里仅作接口预留，若有传入序列化模型则可支持
         self.lstm_cache = {}
 
+    @staticmethod
+    def _normalize_score(s: pd.Series) -> pd.Series:
+        """将分数归一化到 [0, 1]"""
+        s_min, s_max = s.min(), s.max()
+        if s_max - s_min < 1e-8:
+            return pd.Series(0.5, index=s.index)
+        return (s - s_min) / (s_max - s_min)
+
     def select(self, data: pd.DataFrame, top_n: int = 50) -> pd.DataFrame:
-        """执行集成选股"""
+        """执行集成选股 — 融合前先归一化到统一尺度"""
         if data.empty:
             return data
 
@@ -63,16 +71,18 @@ class EnsembleSelector:
         else:
             self.logger.debug("XGBoost 未加载，权重置0")
 
-        # 3. LSTM 打分 (目前由于LSTM需要时间序列，截面上暂用0占位或从缓存读取)
+        # 3. LSTM 打分 (截面占位)
         lstm_scores = pd.Series(0.0, index=data.index)
-        
-        # 模型融合权重
+
+        # 4. 融合前归一化到 [0, 1]
+        xgb_norm = self._normalize_score(xgb_scores)
+        comp_norm = self._normalize_score(comp_scores)
+
+        # 5. 模型融合
         if self.xgb_loaded:
-            # Phase 3 规划: 0.5 * XGB + 0.3 * LSTM + 0.2 * Composite
-            # 在没有 LSTM 截面数据时：0.7 * XGB + 0.3 * Composite
-            final_scores = 0.7 * xgb_scores + 0.3 * comp_scores
+            final_scores = 0.7 * xgb_norm + 0.3 * comp_norm
         else:
-            final_scores = comp_scores
+            final_scores = comp_norm
 
         result["score"] = final_scores
         result["xgb_score"] = xgb_scores

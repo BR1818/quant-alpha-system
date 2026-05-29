@@ -105,7 +105,8 @@ class VolumeMA20RatioFactor:
     description = "当日量/20日均量"
 
     def compute(self, data: pd.DataFrame, params: Optional[Dict[str, Any]] = None) -> pd.Series:
-        avg_vol = data["volume"].rolling(20).mean()
+        # 当日量 / 过去20日均量（分母不含当日）
+        avg_vol = data["volume"].shift(1).rolling(window=20).mean()
         return data["volume"] / avg_vol.replace(0, np.nan)
 
     def get_required_columns(self) -> List[str]:

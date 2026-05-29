@@ -43,7 +43,8 @@ class VolumeRatioFactor:
     def compute(self, data: pd.DataFrame, params: Optional[Dict[str, Any]] = None) -> pd.Series:
         if "volume_ratio" in data.columns:
             return data["volume_ratio"]
-        avg_vol = data["volume"].rolling(window=5).mean()
+        # 量比 = 当日量 / 过去5日均量（分母不含当日）
+        avg_vol = data["volume"].shift(1).rolling(window=5).mean()
         return data["volume"] / avg_vol.replace(0, np.nan)
 
     def get_required_columns(self) -> List[str]:
